@@ -29,9 +29,8 @@ from rich.console import Console
 
 
 import re
-from typing import Any, Literal, Protocol, Tuple, TypeAlias
 from datetime import date, timedelta, datetime
-from time import strftime
+
 import typer
 from pathlib import Path
 from pydantic import BaseModel
@@ -44,6 +43,9 @@ console = Console()
 DATE_FORMAT = "%Y-%m-%d"
 TIME_FORMAT = "%H:%M"
 
+RE_PROJECT = re.compile(r"\+\w+")
+RE_CONTEXT = re.compile(r"\@\w+")
+
 config = ConfigParser()
 
 
@@ -52,16 +54,21 @@ class TTrackItemMeta(BaseModel):
     line: int
 
 
-DoneFlag: TypeAlias = Literal["x", "_"]
-BillableFlag: TypeAlias = Literal["$", "€", "-"]
+DoneFlag: t.TypeAlias = t.Literal["x", "_"]
+BillableFlag: t.TypeAlias = t.Literal["$", "€", "-"]
 
 
-TTKey: TypeAlias = str
-TTValue: TypeAlias = t.Union[date, str, DoneFlag, BillableFlag, "TTrackTimeItem"]
-OptionalTTValue: TypeAlias = TTValue | None
+TTKey: t.TypeAlias = t.Literal["done", "billable", "date", "time", "raw"]
+TTValue: t.TypeAlias = t.Union[date, str, DoneFlag, BillableFlag, "TTrackTimeItemRaw"]
+OptionalTTValue: t.TypeAlias = TTValue | None
 
 
 class TTrackTimeItem(BaseModel):
+    raw: str
+    time: timedelta
+
+
+class TTrackTimeItemRaw(t.TypedDict):
     raw: str
     time: timedelta
 
@@ -103,17 +110,38 @@ class TTrackItem(BaseModel):
         parts.append(self.text)
         return sep.join(parts)
 
+    def has_project(self) -> bool:
+        return RE_PROJECT.search(self.text) is not None
+
+    def has_context(self) -> bool:
+        return RE_CONTEXT.search(self.text) is not None
+
+    @property
+    def project(self) -> str | None:
+        if self.has_project():
+            return None
+        if match := RE_PROJECT.search(self.text):
+            return match.group()
+        return None
+
+    @property
+    def context(self) -> str | None:
+        if self.has_context():
+            return None
+        if match := RE_CONTEXT.search(self.text):
+            return match.group()
+        return None
+
 
 class TTrackRawItem(t.TypedDict):
     done: None | DoneFlag
 
 
 class ParserFunc(t.Protocol):
-    def __class__(self, line: str) -> Tuple[TTKey, OptionalTTValue, str]:
-        pass
+    def __call__(self, line: str) -> t.Tuple[TTKey, OptionalTTValue, str]: ...
 
 
-def split_string(string: str, count: int) -> Tuple[str, str]:
+def split_string(string: str, count: int) -> t.Tuple[str, str]:
     return string[0:count], string[count:]
 
 
@@ -133,7 +161,7 @@ def parser_billable(line: str):
     return key, None, line
 
 
-def parser_date(line: str):
+def parser_date(line: str) -> t.Tuple[TTKey, date, str]:
     val, rest = line.split(" ", 1)
     return "date", datetime.strptime(val, DATE_FORMAT).date(), rest.strip()
 
@@ -154,7 +182,7 @@ def parse_line(line: str) -> dict:
     return result
 
 
-def parser_time(line: str):
+def parser_time(line: str) -> t.Tuple[TTKey, TTrackTimeItemRaw, str]:
     # improve, replace pytimeparse
     key = "time"
     val, rest = line.split(" ", 1)
