@@ -24,8 +24,10 @@ TODO:
 - build with go!?
 """
 
-import os
+import time
 import typing as t
+import logging
+from functools import partial, wraps
 from rich.console import Console
 from typing_extensions import Annotated
 
@@ -41,6 +43,7 @@ from configparser import ConfigParser
 import subprocess
 
 
+log = logging.getLogger(__name__)
 console = Console()
 
 DATE_FORMAT = "%Y-%m-%d"
@@ -50,6 +53,19 @@ RE_PROJECT = re.compile(r"\+\w+")
 RE_CONTEXT = re.compile(r"\@\w+")
 
 config = ConfigParser()
+
+
+def timeit(func: t.Callable):
+    @wraps(func)
+    def timeit_wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        print(f"Function {func.__name__}{args} {kwargs} Took {total_time:.4f} seconds")
+        return result
+
+    return timeit_wrapper
 
 
 class TTrackItemMeta(BaseModel):
@@ -239,21 +255,54 @@ def parse_file(file: Path) -> list[TTrackItem]:
 
 app = typer.Typer()
 
-TIMEFILE = Path("timetrack.txt")
+
+# TODO: no pydantic
+class TTrackFilterOptions(BaseModel):
+    daterange: t.Tuple[date, date] | None = None
+    project: str | None = None
+    context: str | None = None
+    text: str | None = None
 
 
-# config = ConfigParser()
-# config.read(["timetrack.cfg"])
+class TTrackRepository:
+    def __init__(self, timefile: Path):
+        self._data = parse_file(timefile)
+
+    def list(
+        self, filter_options: TTrackFilterOptions | None = None
+    ) -> t.Iterable[TTrackItem]:
+        for item in self._data:
+            if filter_options is None:
+                yield item
+                continue
+            if daterange := filter_options.daterange:
+                start, end = daterange
+                if not (start <= item.date <= end):
+                    continue
+            if project := filter_options.project:
+                if item.project != project:
+                    continue
+            if context := filter_options.context:
+                if item.context != context:
+                    continue
+            if text := filter_options.text:
+                if text not in item.text.lower():
+                    continue
+            yield item
 
 
 class TTrackContextObj:
     CONFIG_FILES: t.Final[list[str]] = ["timetrack.cfg"]
 
     config: ConfigParser
+    repository: TTrackRepository
 
-    def __init__(self):
+    def __init__(
+        self,
+    ):
         self.config = ConfigParser()
         self.config.read(self.CONFIG_FILES)
+        self.repository = TTrackRepository(self.get_timefile())
 
     def _get_timefile_name_context(self):
         today = date.today()
@@ -272,17 +321,33 @@ class TTrackContextObj:
             timefile.touch()
         return timefile
 
-    # def get_editor(self) -> str:
-    #     return self.config.get("timetrack", "editor")
+    def get_rich_line_style(self) -> str:
+        return self.config.get("timetrack", "rich_line_style")
 
+    def get_log_level(self) -> str:
+        return self.config.get("timetrack", "log_level")
 
-def parse_filter_timespan():
-    pass
+    def get_log_file(self) -> str | None:
+        logfile = self.config.get("timetrack", "log_file")
+        if logfile == "-":
+            return None
+        return logfile
+
+    def get_log_format(self) -> str:
+        logformat = self.config.get("timetrack", "log_format")
+        if not logformat:
+            return logging.BASIC_FORMAT
+        return logformat
 
 
 @app.callback()
 def root_callback(ctx: typer.Context):
     ctx.obj = TTrackContextObj()
+    logging.basicConfig(
+        filename=ctx.obj.get_log_file(),
+        level=getattr(logging, ctx.obj.get_log_level()),
+        format=ctx.obj.get_log_format(),
+    )
 
 
 @app.command("add")
@@ -293,31 +358,61 @@ def cmd_add():
 @app.command("ls")
 def cmd_ls(ctx: typer.Context):
     ctx_obj: TTrackContextObj = ctx.obj
-    for line in parse_file(ctx_obj.get_timefile()):
-        console.print(line.to_line(), style="strike blink red")
+    for line in ctx_obj.repository.list():
+        console.print(
+            line.to_line(),
+            style=ctx_obj.get_rich_line_style(),
+        )
+
+
+TIMESPAN_TODAY = "month"
+TIMESPAN_MONTH = "month"
+TIMESPAN_WEEK = "week"
+
+
+def filter_none(item: TTrackItem) -> bool:
+    return True
+
+
+def filter_date_range(item: TTrackItem, tstart: date, tend: date) -> bool:
+    if item.date >= tstart and item.date <= tend:
+        return True
+    return False
 
 
 @app.command("summary")
-def cmd_summary(ctx: typer.Context, timespan=Annotated[str, typer.Argument()]):
+def cmd_summary(
+    ctx: typer.Context,
+    timespan: Annotated[str, typer.Argument()] = TIMESPAN_TODAY,
+):
     ctx_obj: TTrackContextObj = ctx.obj
 
+    filter_options = TTrackFilterOptions()
+
     match timespan:
+        case "all":
+            pass
         case "today":
             tstart = date.today()
             tend = date.today()
+            filter_options.daterange = (tstart, tend)
         case "week":
-            tstart = date.today()
-            tend = date.today() + timespan(days=-7)
+            tend = date.today()
+            tstart = date.today() - timedelta(days=tend.weekday())
+            filter_options.daterange = (tstart, tend)
         case "month":
-            pass
+            tend = date.today()
+            tstart = date(tend.year, tend.month, 1)
+            filter_options.daterange = (tstart, tend)
         case _:
-            parse_filter_timespan(rest)
+            raise NotImplementedError("individual timespans are not yet supported.")
+            # tstart, tend = parse_filter_timespan(timespan)
 
     billable = timedelta(seconds=0)
     overall = timedelta(seconds=0)
 
-    for line in parse_file(ctx_obj.get_timefile()):
-        console.print(line.to_line(), style="strike blink red")
+    for line in ctx_obj.repository.list(filter_options):
+        console.print(line.to_line(), style=ctx_obj.get_rich_line_style())
         if line.is_billable():
             billable += line.time.time
         overall += line.time.time

@@ -1,10 +1,12 @@
 // x $ 2023-10-10 13h hello +world
-$ 2023-10-10 1h hello +project
+// $ 2023-10-10 1h hello +project
 
 
 // heute
 
-x $ 2023-10-10 1h30m hello +another
-2023-10-10 ...... hello +another
-2023-10-10 1h30m hello +another
-2023-10-10 30m hello +another
+// x $ 2023-10-10 1h30m hello +another
+// 2023-10-10 ...... hello +another
+// 2023-10-10 1h30m hello +another
+// 2023-10-10 30m hello +another
+
+2024-07-07 ... hello +tt
