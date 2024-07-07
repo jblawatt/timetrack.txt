@@ -24,8 +24,10 @@ TODO:
 - build with go!?
 """
 
+import os
 import typing as t
 from rich.console import Console
+from typing_extensions import Annotated
 
 
 import re
@@ -36,6 +38,7 @@ from pathlib import Path
 from pydantic import BaseModel
 import pytimeparse
 from configparser import ConfigParser
+import subprocess
 
 
 console = Console()
@@ -243,21 +246,99 @@ TIMEFILE = Path("timetrack.txt")
 # config.read(["timetrack.cfg"])
 
 
+class TTrackContextObj:
+    CONFIG_FILES: t.Final[list[str]] = ["timetrack.cfg"]
+
+    config: ConfigParser
+
+    def __init__(self):
+        self.config = ConfigParser()
+        self.config.read(self.CONFIG_FILES)
+
+    def _get_timefile_name_context(self):
+        today = date.today()
+        return {
+            "year": today.strftime("%Y"),
+            "month": today.strftime("%m"),
+            "day": today.strftime("%d"),
+        }
+
+    def get_timefile(self) -> Path:
+        timefile_name = self.config.get("timetrack", "timefile")
+        timefile = Path(timefile_name.format(**self._get_timefile_name_context()))
+        if not timefile.parent.exists():
+            timefile.parent.mkdir(parents=True)
+        if not timefile.exists():
+            timefile.touch()
+        return timefile
+
+    # def get_editor(self) -> str:
+    #     return self.config.get("timetrack", "editor")
+
+
+def parse_filter_timespan():
+    pass
+
+
 @app.callback()
-def _callback():
-    config.read(["timetrack.cfg"])
+def root_callback(ctx: typer.Context):
+    ctx.obj = TTrackContextObj()
 
 
 @app.command("add")
-def add_cmd():
+def cmd_add():
     pass
 
 
 @app.command("ls")
-def add_ls():
-    print(config.get("timetrack", "input"))
-    for line in parse_file(TIMEFILE):
+def cmd_ls(ctx: typer.Context):
+    ctx_obj: TTrackContextObj = ctx.obj
+    for line in parse_file(ctx_obj.get_timefile()):
         console.print(line.to_line(), style="strike blink red")
+
+
+@app.command("summary")
+def cmd_summary(ctx: typer.Context, timespan=Annotated[str, typer.Argument()]):
+    ctx_obj: TTrackContextObj = ctx.obj
+
+    match timespan:
+        case "today":
+            tstart = date.today()
+            tend = date.today()
+        case "week":
+            tstart = date.today()
+            tend = date.today() + timespan(days=-7)
+        case "month":
+            pass
+        case _:
+            parse_filter_timespan(rest)
+
+    billable = timedelta(seconds=0)
+    overall = timedelta(seconds=0)
+
+    for line in parse_file(ctx_obj.get_timefile()):
+        console.print(line.to_line(), style="strike blink red")
+        if line.is_billable():
+            billable += line.time.time
+        overall += line.time.time
+
+    console.print(
+        "[green]$ {billable}[/green] / {overall}".format(
+            billable=billable, overall=overall
+        )
+    )
+
+
+@app.command("edit")
+def edit_cmd(
+    ctx: typer.Context,
+    editor: Annotated[str, typer.Option("-e", "--editor", envvar="EDITOR")] = "",
+):
+    ctx_obj: TTrackContextObj = ctx.obj
+    if not editor:
+        raise Exception("no editor")
+    timefile = ctx_obj.get_timefile()
+    subprocess.call([editor, str(timefile.absolute())])
 
 
 if __name__ == "__main__":
