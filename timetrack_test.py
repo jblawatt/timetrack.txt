@@ -1,4 +1,11 @@
-from timetrack import TTrackItem, TTrackItemMeta, TTrackTimeItem, parse_line, RE_PROJECT
+from timetrack import (
+    TTrackItem,
+    TTrackItemMeta,
+    TTrackTimeItem,
+    parse_line,
+    RE_PROJECT,
+    RE_CONTEXT,
+)
 from pathlib import Path
 import pytest
 from datetime import date, timedelta
@@ -59,6 +66,15 @@ def test_get_project():
     assert RE_PROJECT.search("hello world") is None
     assert RE_PROJECT.search("+project hello world") is not None
     assert RE_PROJECT.search("hello world +project") is not None
+    assert RE_PROJECT.search("hello abc+abc foo") is None
+
+
+def test_get_context():
+    assert RE_CONTEXT.search("hello @context world") is not None
+    assert RE_CONTEXT.search("hello world") is None
+    assert RE_CONTEXT.search("@context hello world") is not None
+    assert RE_CONTEXT.search("hello world @context") is not None
+    assert RE_CONTEXT.search("hello hello@hello.de foo") is None
 
 
 @pytest.fixture(name="test_item")
