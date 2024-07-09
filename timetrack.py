@@ -312,11 +312,13 @@ class TTrackContextObj:
     config: ConfigParser
     repository: TTrackRepository
 
-    def __init__(
-        self,
-    ):
+    def __init__(self, config_file: str | None = None):
+        self.config_file = config_file
         self.config = ConfigParser()
-        self.config.read(self.CONFIG_FILES)
+        if config_file:
+            self.config.read([config_file])
+        else:
+            self.config.read(self.CONFIG_FILES)
         self.repository = TTrackRepository(self.get_timefile())
 
     def _get_timefile_name_context(self):
@@ -401,8 +403,13 @@ def timespan_to_filter_options(timespan: str) -> TTrackFilterOptions:
 
 
 @app.callback()
-def root_callback(ctx: typer.Context):
-    ctx.obj = TTrackContextObj()
+def root_callback(
+    ctx: typer.Context,
+    config_file: Annotated[
+        str, typer.Option("-c", "--config", envvar="TT_CONFIG_FILE")
+    ] = None,
+):
+    ctx.obj = TTrackContextObj(config_file)
     logging.basicConfig(
         filename=ctx.obj.get_log_file(),
         level=getattr(logging, ctx.obj.get_log_level()),
