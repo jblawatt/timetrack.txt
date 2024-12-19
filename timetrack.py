@@ -30,16 +30,16 @@ import re
 import subprocess
 import typing as t
 from configparser import ConfigParser
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from contextlib import contextmanager
-from rich.table import Table
-from rich import box
 
 import pytimeparse
 import typer
 from pydantic import BaseModel
+from rich import box
 from rich.console import Console
+from rich.table import Table
 from typing_extensions import Annotated
 
 log = logging.getLogger(__name__)
@@ -277,6 +277,7 @@ class TTrackRepository:
         self._data = parse_file(self.timefile)
 
     def add(self, line: list[str] | TTrackItem | TTrackRawItem):
+        breakpoint()
         if isinstance(line, (dict, TTrackItem)):
             # TODO: implement
             raise NotImplementedError("not yet implemented")
@@ -373,9 +374,9 @@ class TTrackContextObj:
             subprocess.call(command, cwd=str(self.get_hookdir().absolute()))
 
 
-TIMESPAN_TODAY = "month"
-TIMESPAN_MONTH = "month"
-TIMESPAN_WEEK = "week"
+TIMESPAN_TODAY: t.Final[str] = "month"
+TIMESPAN_MONTH: t.Final[str] = "month"
+TIMESPAN_WEEK: t.Final[str] = "week"
 
 
 def timespan_to_filter_options(timespan: str) -> TTrackFilterOptions:
@@ -459,7 +460,7 @@ def cmd_summary(
     billable = timedelta(seconds=0)
     overall = timedelta(seconds=0)
 
-    table = Table(box=box.MINIMAL, padding=(0, 3))
+    table = Table(box=box.MINIMAL, padding=(0, 1))
     table.add_column("#", justify="right")
     table.add_column("x")
     table.add_column("$")
