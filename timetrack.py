@@ -212,7 +212,8 @@ def parser_time(line: str) -> t.Tuple[TTKey, TTrackTimeItemRaw, str]:
         )
 
 
-def parse_line(line: str, context: dict[TTKey, OptionalTTValue]) -> dict:
+def parse_line(line: str, context: dict[TTKey, OptionalTTValue] | None = None) -> dict:
+    context = context or {}
     parsers: list[ParserFunc | None] = [
         parser_done,
         parser_billable,
@@ -390,7 +391,7 @@ class TTrackContextObj:
             subprocess.call(command, cwd=str(self.get_hookdir().absolute()))
 
 
-TIMESPAN_TODAY: t.Final[str] = "month"
+TIMESPAN_TODAY: t.Final[str] = "today"
 TIMESPAN_MONTH: t.Final[str] = "month"
 TIMESPAN_WEEK: t.Final[str] = "week"
 
