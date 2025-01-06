@@ -173,9 +173,15 @@ def parser_billable(line: str):
     return key, None, line
 
 
-def parser_date(line: str) -> t.Tuple[TTKey, date, str]:
-    val, rest = line.split(" ", 1)
-    return "date", datetime.strptime(val, DATE_FORMAT).date(), rest.strip()
+def parser_date(line: str) -> t.Tuple[TTKey, date | None, str]:
+    splitted = line.split(" ", 1)
+    if len(splitted) == 1:
+        splitted.append("")
+    val, rest = splitted
+    try:
+        return "date", datetime.strptime(val, DATE_FORMAT).date(), rest.strip()
+    except ValueError:
+        return "date", None, line
 
 
 def parser_time(line: str) -> t.Tuple[TTKey, TTrackTimeItemRaw, str]:
@@ -206,15 +212,17 @@ def parser_time(line: str) -> t.Tuple[TTKey, TTrackTimeItemRaw, str]:
         )
 
 
-def parse_line(line: str) -> dict:
-    parsers: list[ParserFunc] = [
+def parse_line(line: str, context: dict[TTKey, OptionalTTValue]) -> dict:
+    parsers: list[ParserFunc | None] = [
         parser_done,
         parser_billable,
-        parser_date,
+        None if "date" in context else parser_date,
         parser_time,
     ]
-    result: dict[TTKey, OptionalTTValue] = {}
+    result: dict[TTKey, OptionalTTValue] = {**context}
     for p in parsers:
+        if p is None:
+            continue
         key, value, line = p(line)
         result[key] = value
 
@@ -226,17 +234,26 @@ def parse_file(file: Path) -> list[TTrackItem]:
     result = []
     with file.open("r") as fhandle:
         line_no = 0
+        context: dict[TTKey, OptionalTTValue] = {}
         while line := fhandle.readline():
             line_no += 1
             if not line.strip() or line.strip().startswith("//"):
                 continue
+            match parser_date(line.strip()):
+                case ("date", date() as ctx_date, ""):
+                    context["date"] = ctx_date
+                    continue
+            if not line.startswith("  ") and "date" in context:
+                del context["date"]
+            else:
+                line = line.strip()
             item = TTrackItem.model_validate(
                 {
                     "meta": {
                         "file": file,
                         "line": line_no,
                     },
-                    **parse_line(line),
+                    **parse_line(line, context),
                 },
             )
             result.append(item)
@@ -277,12 +294,11 @@ class TTrackRepository:
         self._data = parse_file(self.timefile)
 
     def add(self, line: list[str] | TTrackItem | TTrackRawItem):
-        breakpoint()
         if isinstance(line, (dict, TTrackItem)):
             # TODO: implement
             raise NotImplementedError("not yet implemented")
         with self.timefile.open("a") as fhandle:
-            fhandle.writelines([" ".join(line).strip()])
+            fhandle.writelines([os.linesep, " ".join(line).strip()])
 
     def list(
         self, filter_options: TTrackFilterOptions | None = None

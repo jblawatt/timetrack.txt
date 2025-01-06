@@ -5,6 +5,7 @@ from timetrack import (
     parse_line,
     RE_PROJECT,
     RE_CONTEXT,
+    parser_date,
 )
 from pathlib import Path
 import pytest
@@ -108,3 +109,13 @@ def test_has_project(text: str, expected: bool, test_item: TTrackItem):
 def test_has_context(text: str, expected: bool, test_item: TTrackItem):
     test_item.text = text
     assert test_item.has_context() == expected
+
+
+def test_parser_date():
+    key, date, str_ = parser_date("2023-10-10")
+    print(key, date, str_)
+
+
+def test_parser_date_fail():
+    key, date, str_ = parser_date("not-a-date")
+    print(key, date, str_)
