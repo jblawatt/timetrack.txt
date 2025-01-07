@@ -24,7 +24,8 @@ TODO:
 - build with go!?
 """
 
-import typing as t
+from time import mktime
+import itertools
 import logging
 import os
 import re
@@ -32,11 +33,10 @@ import subprocess
 import typing as t
 from configparser import ConfigParser
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 import pytimeparse
-from rich.style import StyleType
 import typer
 from pydantic import BaseModel, Field
 from rich import box
@@ -44,8 +44,8 @@ from rich.console import Console
 from rich.table import Table
 from typing_extensions import Annotated
 
-log = logging.getLogger(__name__)
-console = Console()
+LOG = logging.getLogger(__name__)
+CONSOLE = Console()
 
 DATE_FORMAT = "%Y-%m-%d"
 TIME_FORMAT = "%H:%M"
@@ -468,6 +468,7 @@ class TTrackContextObj:
 TIMESPAN_TODAY: t.Final[str] = "today"
 TIMESPAN_MONTH: t.Final[str] = "month"
 TIMESPAN_WEEK: t.Final[str] = "week"
+TIMESPAN_YESTERDAY: t.Final[str] = "yesterday"
 
 
 def timespan_to_filter_options(timespan: str) -> TTrackFilterOptions:
@@ -538,8 +539,23 @@ def cmd_add(
     ctx_obj.apply_hook("post-add", {})
 
 
+class TTrackBaseItem(t.Protocol):
+    @property
+    def date(self) -> date: ...
+
+
+def to_unix_timestamp(value: date | datetime) -> int:
+    return int(mktime(value.timetuple()))
+
+
+def group_by_day(item: TTrackBaseItem) -> int:
+    return to_unix_timestamp(item.date)
+
+
 @app.command("ls")
+@app.command("list")
 @app.command("summary")
+@measure_time()
 def cmd_summary(
     ctx: typer.Context,
     timespan: Annotated[str, typer.Argument()] = TIMESPAN_TODAY,
@@ -548,71 +564,80 @@ def cmd_summary(
 
     filter_options = timespan_to_filter_options(timespan)
 
-    billable = timedelta(seconds=0)
-    overall = timedelta(seconds=0)
-    worktime = timedelta(seconds=0)
-    current_wd_item: TTrackWorkday | None = None
-
     table = Table(box=box.MINIMAL, padding=(0, 1))
     table.add_column("#", justify="right")
     table.add_column("x")
     table.add_column("$")
     table.add_column("date")
+    table.add_column("s/e")
     table.add_column("time", justify="right")
     table.add_column("text")
     table.add_column("project", justify="right")
     table.add_column("context", justify="right")
 
-    for index, line in enumerate(ctx_obj.repository.list(filter_options)):
-        # console.print(line.to_line(), style=ctx_obj.get_rich_line_style())
-        if isinstance(line, TTrackItem):
-            table.add_row(
-                str(index),
-                line.done or "-",
-                line.billable or "_",
-                line.date.strftime(DATE_FORMAT),
-                line.time.format(),
-                line.text,
-                line.project,
-                line.context,
-            )
-            if line.is_billable():
-                billable += line.time.time
-            overall += line.time.time
-        if isinstance(line, TTrackWorkday):
-            if current_wd_item is not None:
-                worktime += current_wd_item.diff(line)
-                current_wd_item = None
-            else:
-                current_wd_item = line
-            table.add_row(
-                str(index),
-                "",
-                line.time.SYMBOL,
-                line.date.strftime(DATE_FORMAT),
-                datetime.strftime(
-                    datetime.combine(line.date, line.time.time), TIME_FORMAT
-                ),
-                format_timedelta(worktime),
-                "",
-                "",
-                # TODO: from config
-                style="green",
-            )
+    all_items = ctx_obj.repository.list(filter_options)
 
-    table.add_row(
-        "",
-        "",
-        format_timedelta(billable),
-        "",
-        format_timedelta(overall),
-        "",
-        "",
-        "",
-        end_section=True,
-    )
+    grouped_items = itertools.groupby(all_items, group_by_day)
 
-    console.print(table)
+    for group, items in grouped_items:
+        billable = timedelta(seconds=0)
+        overall = timedelta(seconds=0)
+
+        worktime = timedelta(seconds=0)
+        current_wd_item: TTrackWorkday | None = None
+        for index, line in enumerate(items):
+            if isinstance(line, TTrackItem):
+                table.add_row(
+                    str(index),
+                    line.done or "-",
+                    line.billable or "_",
+                    line.date.strftime(DATE_FORMAT),
+                    "",
+                    line.time.format(),
+                    line.text,
+                    line.project,
+                    line.context,
+                )
+                if line.is_billable():
+                    billable += line.time.time
+                overall += line.time.time
+            if isinstance(line, TTrackWorkday):
+                if current_wd_item is not None:
+                    worktime += current_wd_item.diff(line)
+                    current_wd_item = None
+                else:
+                    current_wd_item = line
+                table.add_row(
+                    str(index),
+                    "",
+                    line.time.SYMBOL,
+                    line.date.strftime(DATE_FORMAT),
+                    datetime.strftime(
+                        datetime.combine(line.date, line.time.time), TIME_FORMAT
+                    ),
+                    format_timedelta(worktime),
+                    "",
+                    "",
+                    "",
+                    # TODO: from config
+                    style="green" if line.time.SYMBOL == ">" else "red",
+                )
+
+        table.add_row(
+            "",
+            "",
+            format_timedelta(billable),
+            "",
+            format_timedelta(worktime),
+            "",
+            format_timedelta(overall),
+            "",
+            "",
+            style="blue bold",
+            end_section=True,
+        )
+
+    CONSOLE.print(table)
 
 
 @app.command("edit")
