@@ -36,6 +36,7 @@ from datetime import date, datetime, timedelta, time
 from pathlib import Path
 
 import pytimeparse
+from rich.style import StyleType
 import typer
 from pydantic import BaseModel, Field
 from rich import box
@@ -115,7 +116,12 @@ class TTrackEndTime(TTrackTime):
 class TTrackWorkday(BaseModel):
     meta: TTrackWorkdayMeta
     date: date
-    times: list[TTrackStartTime | TTrackEndTime] = Field(default_factory=list)
+    time: TTrackStartTime | TTrackEndTime
+
+    def diff(self, other: "TTrackWorkday") -> timedelta:
+        return datetime.combine(other.date, other.time.time) - datetime.combine(
+            self.date, self.time.time
+        )
 
 
 class TTrackItem(BaseModel):
@@ -277,8 +283,8 @@ def parse_workday_time(line: str) -> TTrackStartTime | TTrackEndTime:
     return klass(time=datetime.strptime(line, TIME_FORMAT).time())
 
 
-def parse_file(file: Path) -> TTrackData:
-    result = TTrackData()
+def parse_file(file: Path) -> list[TTrackItem | TTrackWorkday]:
+    result: list[TTrackItem | TTrackWorkday] = []
     with file.open("r") as fhandle:
         line_no = 0
         context: dict[TTKey, OptionalTTValue] = {}
@@ -299,14 +305,15 @@ def parse_file(file: Path) -> TTrackData:
                     raise RuntimeError(
                         "you cannot add workday outside of date context."
                     ) from error
-                workday = result.get_or_create_workday(
-                    t.cast(date, date_),
+                item = TTrackWorkday(
+                    date=t.cast(date, date_),
+                    time=parse_workday_time(line),
                     meta=TTrackWorkdayMeta(
                         file=file,
                         line=line_no,
                     ),
                 )
-                workday.times.append(parse_workday_time(line))
+                result.append(item)
                 continue
             else:
                 line = line.strip()
@@ -319,7 +326,7 @@ def parse_file(file: Path) -> TTrackData:
                     **parse_line(line, context),
                 },
             )
-            result.items.append(item)
+            result.append(item)
     return result
 
 
@@ -365,8 +372,8 @@ class TTrackRepository:
 
     def list(
         self, filter_options: TTrackFilterOptions | None = None
-    ) -> t.Iterable[TTrackItem]:
-        for item in self._data.items:
+    ) -> t.Iterable[TTrackItem | TTrackWorkday]:
+        for item in self._data:
             if filter_options is None:
                 yield item
                 continue
@@ -374,15 +381,16 @@ class TTrackRepository:
                 start, end = daterange
                 if not (start <= item.date <= end):
                     continue
-            if project := filter_options.project:
-                if item.project != project:
-                    continue
-            if context := filter_options.context:
-                if item.context != context:
-                    continue
-            if text := filter_options.text:
-                if text not in item.text.lower():
-                    continue
+            if isinstance(item, TTrackItem):
+                if project := filter_options.project:
+                    if item.project != project:
+                        continue
+                if context := filter_options.context:
+                    if item.context != context:
+                        continue
+                if text := filter_options.text:
+                    if text not in item.text.lower():
+                        continue
             yield item
 
 
@@ -542,6 +550,8 @@ def cmd_summary(
 
     billable = timedelta(seconds=0)
     overall = timedelta(seconds=0)
+    worktime = timedelta(seconds=0)
+    current_wd_item: TTrackWorkday | None = None
 
     table = Table(box=box.MINIMAL, padding=(0, 1))
     table.add_column("#", justify="right")
@@ -555,19 +565,40 @@ def cmd_summary(
 
     for index, line in enumerate(ctx_obj.repository.list(filter_options)):
         # console.print(line.to_line(), style=ctx_obj.get_rich_line_style())
-        table.add_row(
-            str(index),
-            line.done or "-",
-            line.billable or "_",
-            line.date.strftime(DATE_FORMAT),
-            line.time.format(),
-            line.text,
-            line.project,
-            line.context,
-        )
-        if line.is_billable():
-            billable += line.time.time
-        overall += line.time.time
+        if isinstance(line, TTrackItem):
+            table.add_row(
+                str(index),
+                line.done or "-",
+                line.billable or "_",
+                line.date.strftime(DATE_FORMAT),
+                line.time.format(),
+                line.text,
+                line.project,
+                line.context,
+            )
+            if line.is_billable():
+                billable += line.time.time
+            overall += line.time.time
+        if isinstance(line, TTrackWorkday):
+            if current_wd_item is not None:
+                worktime += current_wd_item.diff(line)
+                current_wd_item = None
+            else:
+                current_wd_item = line
+            table.add_row(
+                str(index),
+                "",
+                line.time.SYMBOL,
+                line.date.strftime(DATE_FORMAT),
+                datetime.strftime(
+                    datetime.combine(line.date, line.time.time), TIME_FORMAT
+                ),
+                format_timedelta(worktime),
+                "",
+                "",
+                # TODO: from config
+                style="green",
+            )
 
     table.add_row(
         "",
