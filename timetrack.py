@@ -24,6 +24,7 @@ TODO:
 - build with go!?
 """
 
+import typing as t
 import logging
 import os
 import re
@@ -31,12 +32,12 @@ import subprocess
 import typing as t
 from configparser import ConfigParser
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time
 from pathlib import Path
 
 import pytimeparse
 import typer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from rich import box
 from rich.console import Console
 from rich.table import Table
@@ -51,12 +52,18 @@ TIME_FORMAT = "%H:%M"
 RE_PROJECT = re.compile(r"^\+\w+| \+\w+")
 RE_CONTEXT = re.compile(r"^\@\w+| \@\w+")
 
-config = ConfigParser()
 
-
-class TTrackItemMeta(BaseModel):
+class TTrackFileMeta(BaseModel):
     file: Path
     line: int
+
+
+class TTrackItemMeta(TTrackFileMeta):
+    pass
+
+
+class TTrackWorkdayMeta(TTrackFileMeta):
+    pass
 
 
 DoneFlag: t.TypeAlias = t.Literal["x", "_"]
@@ -91,6 +98,24 @@ class TTrackTimeItem(BaseModel):
 class TTrackTimeItemRaw(t.TypedDict):
     raw: str
     time: timedelta
+
+
+class TTrackTime(BaseModel):
+    time: time
+
+
+class TTrackStartTime(TTrackTime):
+    SYMBOL: t.Literal[">"] = ">"
+
+
+class TTrackEndTime(TTrackTime):
+    SYMBOL: t.Literal["<"] = "<"
+
+
+class TTrackWorkday(BaseModel):
+    meta: TTrackWorkdayMeta
+    date: date
+    times: list[TTrackStartTime | TTrackEndTime] = Field(default_factory=list)
 
 
 class TTrackItem(BaseModel):
@@ -147,6 +172,19 @@ class TTrackItem(BaseModel):
 
 class TTrackRawItem(t.TypedDict):
     done: None | DoneFlag
+
+
+class TTrackData(BaseModel):
+    items: list[TTrackItem] = Field(default_factory=list)
+    workdays: list[TTrackWorkday] = Field(default_factory=list)
+
+    def get_or_create_workday(self, date_: date, meta: TTrackWorkdayMeta):
+        for wd in self.workdays:
+            if wd.date == date_:
+                return wd
+        wd = TTrackWorkday(meta=meta, date=date_)
+        self.workdays.append(wd)
+        return wd
 
 
 class ParserFunc(t.Protocol):
@@ -231,8 +269,16 @@ def parse_line(line: str, context: dict[TTKey, OptionalTTValue] | None = None) -
     return result
 
 
-def parse_file(file: Path) -> list[TTrackItem]:
-    result = []
+def parse_workday_time(line: str) -> TTrackStartTime | TTrackEndTime:
+    line = line.strip(" ")
+    klass = TTrackStartTime if line[0] == ">" else TTrackEndTime
+    line = line[1:]
+    line = line.strip()
+    return klass(time=datetime.strptime(line, TIME_FORMAT).time())
+
+
+def parse_file(file: Path) -> TTrackData:
+    result = TTrackData()
     with file.open("r") as fhandle:
         line_no = 0
         context: dict[TTKey, OptionalTTValue] = {}
@@ -246,6 +292,22 @@ def parse_file(file: Path) -> list[TTrackItem]:
                     continue
             if not line.startswith("  ") and "date" in context:
                 del context["date"]
+            elif line.startswith("  >") or line.startswith("  <"):
+                try:
+                    date_ = context["date"]
+                except KeyError as error:
+                    raise RuntimeError(
+                        "you cannot add workday outside of date context."
+                    ) from error
+                workday = result.get_or_create_workday(
+                    t.cast(date, date_),
+                    meta=TTrackWorkdayMeta(
+                        file=file,
+                        line=line_no,
+                    ),
+                )
+                workday.times.append(parse_workday_time(line))
+                continue
             else:
                 line = line.strip()
             item = TTrackItem.model_validate(
@@ -257,7 +319,7 @@ def parse_file(file: Path) -> list[TTrackItem]:
                     **parse_line(line, context),
                 },
             )
-            result.append(item)
+            result.items.append(item)
     return result
 
 
@@ -304,7 +366,7 @@ class TTrackRepository:
     def list(
         self, filter_options: TTrackFilterOptions | None = None
     ) -> t.Iterable[TTrackItem]:
-        for item in self._data:
+        for item in self._data.items:
             if filter_options is None:
                 yield item
                 continue
@@ -332,7 +394,12 @@ class TTrackContextObj:
 
     def __init__(self, config_file: str | None = None):
         self.config_file = config_file
-        self.config = ConfigParser()
+        self.config = ConfigParser(
+            {
+                **self._get_timefile_name_context(),
+                **os.environ,
+            }
+        )
         if config_file:
             self.config.read([config_file])
         else:
@@ -342,15 +409,14 @@ class TTrackContextObj:
     def _get_timefile_name_context(self):
         today = date.today()
         return {
-            "year": today.strftime("%Y"),
-            "month": today.strftime("%m"),
-            "day": today.strftime("%d"),
-            **os.environ,
+            "tt_year": today.strftime("%Y"),
+            "tt_month": today.strftime("%m"),
+            "tt_day": today.strftime("%d"),
         }
 
     def get_timefile(self) -> Path:
         timefile_name = self.config.get("timetrack", "timefile")
-        timefile = Path(timefile_name.format(**self._get_timefile_name_context()))
+        timefile = Path(timefile_name)
         if not timefile.parent.exists():
             timefile.parent.mkdir(parents=True)
         if not timefile.exists():
@@ -550,6 +616,13 @@ def edit_cmd(
 def test_cmd(ctx: typer.Context):
     ctx_obj: TTrackContextObj = ctx.obj
     print(ctx_obj.config.options("hooks"))
+
+
+@app.command("info")
+def info_cmd(ctx: typer.Context):
+    ctx_obj: TTrackContextObj = ctx.obj
+    typer.echo(f"timefile: {ctx_obj.get_timefile()}")
+    typer.echo(f"hookdir: {ctx_obj.get_hookdir()}")
 
 
 if __name__ == "__main__":
