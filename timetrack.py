@@ -474,7 +474,7 @@ TIMESPAN_YESTERDAY: t.Final[str] = "yesterday"
 def timespan_to_filter_options(timespan: str) -> TTrackFilterOptions:
     filter_options = TTrackFilterOptions()
     match timespan:
-        case "all":
+        case "all" | "al" | "a":
             pass
         case "today" | "t" | "to":
             tstart = tend = date.today()
@@ -552,13 +552,23 @@ def group_by_day(item: TTrackBaseItem) -> int:
     return to_unix_timestamp(item.date)
 
 
+def group_by_week(time: TTrackBaseItem) -> str:
+    return time.date.strftime("%Y%U")
+
+
+GROUP_FUNCTIONS = {
+    "day": group_by_day,
+    "week": group_by_week,
+}
+
+
 @app.command("ls")
 @app.command("list")
 @app.command("summary")
-@measure_time()
 def cmd_summary(
     ctx: typer.Context,
     timespan: Annotated[str, typer.Argument()] = TIMESPAN_TODAY,
+    group: Annotated[str, typer.Option("-g", "--group")] = "day",
 ):
     ctx_obj: TTrackContextObj = ctx.obj
 
@@ -577,9 +587,9 @@ def cmd_summary(
 
     all_items = ctx_obj.repository.list(filter_options)
 
-    grouped_items = itertools.groupby(all_items, group_by_day)
+    grouped_items = itertools.groupby(all_items, GROUP_FUNCTIONS[group])
 
-    for group, items in grouped_items:
+    for _, items in grouped_items:
         billable = timedelta(seconds=0)
         overall = timedelta(seconds=0)
 
