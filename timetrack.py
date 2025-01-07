@@ -35,6 +35,7 @@ from configparser import ConfigParser
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from functools import partial
 
 import pytimeparse
 import typer
@@ -256,12 +257,24 @@ def parser_time(line: str) -> t.Tuple[TTKey, TTrackTimeItemRaw, str]:
         )
 
 
+def parser_date_or_context(
+    line: str, fallback: date
+) -> t.Tuple[TTKey, date | None, str]:
+    line = line.lstrip()
+    if line.startswith("*"):
+        return "date", fallback, line[1:].lstrip()
+    return parser_date(line)
+
+
 def parse_line(line: str, context: dict[TTKey, OptionalTTValue] | None = None) -> dict:
     context = context or {}
+
+    dparse = partial(parser_date_or_context, fallback=context["prev_date"])
+
     parsers: list[ParserFunc | None] = [
         parser_done,
         parser_billable,
-        None if "date" in context else parser_date,
+        None if "date" in context else dparse,
         parser_time,
     ]
     result: dict[TTKey, OptionalTTValue] = {**context}
@@ -298,7 +311,7 @@ def parse_file(file: Path) -> list[TTrackItem | TTrackWorkday]:
                     continue
             if not line.startswith("  ") and "date" in context:
                 del context["date"]
-            elif line.startswith("  >") or line.startswith("  <"):
+            if line.startswith("  >") or line.startswith("  <"):
                 try:
                     date_ = context["date"]
                 except KeyError as error:
@@ -313,6 +326,7 @@ def parse_file(file: Path) -> list[TTrackItem | TTrackWorkday]:
                         line=line_no,
                     ),
                 )
+                context["prev_date"] = item.date
                 result.append(item)
                 continue
             else:
@@ -326,6 +340,7 @@ def parse_file(file: Path) -> list[TTrackItem | TTrackWorkday]:
                     **parse_line(line, context),
                 },
             )
+            context["prev_date"] = item.date
             result.append(item)
     return result
 
@@ -499,7 +514,7 @@ def timespan_to_filter_options(timespan: str) -> TTrackFilterOptions:
 def root_callback(
     ctx: typer.Context,
     config_file: Annotated[
-        str, typer.Option("-c", "--config", envvar="TT_CONFIG_FILE")
+        str | None, typer.Option("-c", "--config", envvar="TT_CONFIG_FILE")
     ] = None,
 ):
     ctx.obj = TTrackContextObj(config_file)
@@ -639,14 +654,15 @@ def cmd_summary(
             format_timedelta(billable),
             "",
             format_timedelta(worktime),
-            "",
             format_timedelta(overall),
+            "",
             "",
             "",
             style="blue bold",
             end_section=True,
         )
 
+    table
     CONSOLE.print(table)
 
 
