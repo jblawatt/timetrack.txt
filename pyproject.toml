@@ -3,11 +3,12 @@ name = "timetrack-txt"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13.1"
+requires-python = ">=3.13"
 dependencies = [
     "pydantic>=2.10.4",
     "pytimeparse>=1.1.8",
     "typer>=0.15.1",
+    "watchdog>=6.0.0",
 ]
 
 [dependency-groups]
@@ -15,5 +16,6 @@ dev = [
     "isort>=5.13.2",
     "mypy>=1.14.1",
     "pylint>=3.3.3",
+    "pytest>=8.3.4",
     "ruff>=0.8.6",
 ]

@@ -24,7 +24,13 @@ TODO:
 - build with go!?
 """
 
-from time import mktime
+from watchdog.events import PatternMatchingEventHandler
+
+from watchdog.observers import Observer
+
+from rich.live import Live
+from time import mktime, sleep
+
 import itertools
 import logging
 import os
@@ -577,6 +583,99 @@ GROUP_FUNCTIONS = {
 }
 
 
+class SummaryTable:
+    def __init__(self, repository: TTrackRepository):
+        self.repository = repository
+
+        table = Table(box=box.MINIMAL, padding=(0, 1))
+        table.add_column("#", justify="right")
+        table.add_column("x")
+        table.add_column("$")
+        table.add_column("date")
+        table.add_column("s/e")
+        table.add_column("wtime")
+        table.add_column("time", justify="right")
+        table.add_column("text")
+        table.add_column("project", justify="right")
+        table.add_column("context", justify="right")
+        self.table = table
+
+    def load(self, timespan: str, group: str, reload: bool = False):
+        self.table.rows.clear()
+
+        filter_options = timespan_to_filter_options(timespan)
+
+        if reload:
+            self.repository.load()
+        all_items = self.repository.list(filter_options)
+
+        grouped_items = itertools.groupby(all_items, GROUP_FUNCTIONS[group])
+
+        for _, items in grouped_items:
+            billable = timedelta(seconds=0)
+            overall = timedelta(seconds=0)
+
+            worktime = timedelta(seconds=0)
+            current_wd_item: TTrackWorkday | None = None
+            for index, line in enumerate(items):
+                if isinstance(line, TTrackItem):
+                    self.table.add_row(
+                        str(index),
+                        line.done or "-",
+                        line.billable or "_",
+                        "",
+                        line.date.strftime(DATE_FORMAT),
+                        "",
+                        line.time.format(),
+                        line.text,
+                        line.project,
+                        line.context,
+                    )
+                    if line.is_billable():
+                        billable += line.time.time
+                    overall += line.time.time
+                if isinstance(line, TTrackWorkday):
+                    if current_wd_item is not None:
+                        worktime += current_wd_item.diff(line)
+                        current_wd_item = None
+                    else:
+                        current_wd_item = line
+                    self.table.add_row(
+                        str(index),
+                        "",
+                        "",
+                        line.date.strftime(DATE_FORMAT),
+                        "{} {}".format(
+                            line.time.SYMBOL,
+                            datetime.strftime(
+                                datetime.combine(line.date, line.time.time), TIME_FORMAT
+                            ),
+                        ),
+                        format_timedelta(worktime) if line.time.SYMBOL == "<" else "",
+                        format_timedelta(overall) if line.time.SYMBOL == "<" else "",
+                        "",
+                        "",
+                        "",
+                        # TODO: from config
+                        style="green" if line.time.SYMBOL == ">" else "red",
+                    )
+
+            self.table.add_row(
+                "",
+                "",
+                format_timedelta(billable),
+                "",
+                "",
+                format_timedelta(worktime),
+                format_timedelta(overall),
+                "",
+                "",
+                "",
+                style="blue bold",
+                end_section=True,
+            )
+
+
 @app.command("ls")
 @app.command("list")
 @app.command("summary")
@@ -584,86 +683,45 @@ def cmd_summary(
     ctx: typer.Context,
     timespan: Annotated[str, typer.Argument()] = TIMESPAN_TODAY,
     group: Annotated[str, typer.Option("-g", "--group")] = "day",
+    watch: Annotated[bool, typer.Option("-w", is_flag=True)] = False,
 ):
     ctx_obj: TTrackContextObj = ctx.obj
-
-    filter_options = timespan_to_filter_options(timespan)
-
-    table = Table(box=box.MINIMAL, padding=(0, 1))
-    table.add_column("#", justify="right")
-    table.add_column("x")
-    table.add_column("$")
-    table.add_column("date")
-    table.add_column("s/e")
-    table.add_column("time", justify="right")
-    table.add_column("text")
-    table.add_column("project", justify="right")
-    table.add_column("context", justify="right")
-
-    all_items = ctx_obj.repository.list(filter_options)
-
-    grouped_items = itertools.groupby(all_items, GROUP_FUNCTIONS[group])
-
-    for _, items in grouped_items:
-        billable = timedelta(seconds=0)
-        overall = timedelta(seconds=0)
-
-        worktime = timedelta(seconds=0)
-        current_wd_item: TTrackWorkday | None = None
-        for index, line in enumerate(items):
-            if isinstance(line, TTrackItem):
-                table.add_row(
-                    str(index),
-                    line.done or "-",
-                    line.billable or "_",
-                    line.date.strftime(DATE_FORMAT),
-                    "",
-                    line.time.format(),
-                    line.text,
-                    line.project,
-                    line.context,
-                )
-                if line.is_billable():
-                    billable += line.time.time
-                overall += line.time.time
-            if isinstance(line, TTrackWorkday):
-                if current_wd_item is not None:
-                    worktime += current_wd_item.diff(line)
-                    current_wd_item = None
-                else:
-                    current_wd_item = line
-                table.add_row(
-                    str(index),
-                    "",
-                    line.time.SYMBOL,
-                    line.date.strftime(DATE_FORMAT),
-                    datetime.strftime(
-                        datetime.combine(line.date, line.time.time), TIME_FORMAT
-                    ),
-                    format_timedelta(worktime),
-                    "",
-                    "",
-                    "",
-                    # TODO: from config
-                    style="green" if line.time.SYMBOL == ">" else "red",
-                )
-
-        table.add_row(
-            "",
-            "",
-            format_timedelta(billable),
-            "",
-            format_timedelta(worktime),
-            format_timedelta(overall),
-            "",
-            "",
-            "",
-            style="blue bold",
-            end_section=True,
+    table = SummaryTable(ctx_obj.repository)
+    if watch:
+        raise NotImplementedError("currently not implemented")
+        live = Live(
+            table.table,
+            auto_refresh=True,
+            refresh_per_second=1,
+            console=CONSOLE,
         )
+        live.start()
+        event_handler = PatternMatchingEventHandler(patterns=["*.txt"])
 
-    table
-    CONSOLE.print(table)
+        def on_modified(e):
+            table.load(timespan, group, reload=True)
+            return True
+
+        event_handler.on_any_event = on_modified
+        observer = Observer()
+        observer.schedule(
+            event_handler,
+            path=str(ctx_obj.get_timefile().parent),
+        )
+        observer.start()
+        try:
+            table.load(timespan, group)
+            live.refresh()
+            while True:
+                sleep(1)
+                print("sleep")
+        finally:
+            live.stop()
+            observer.stop()
+            observer.join()
+    else:
+        table.load(timespan, group)
+        CONSOLE.print(table.table)
 
 
 @app.command("edit")
