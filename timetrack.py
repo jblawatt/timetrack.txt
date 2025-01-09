@@ -24,7 +24,7 @@ TODO:
 - build with go!?
 """
 
-from watchdog.events import PatternMatchingEventHandler
+from watchdog.events import PatternMatchingEventHandler, FileSystemEvent
 
 from watchdog.observers import Observer
 
@@ -686,40 +686,40 @@ def cmd_summary(
     watch: Annotated[bool, typer.Option("-w", is_flag=True)] = False,
 ):
     ctx_obj: TTrackContextObj = ctx.obj
-    table = SummaryTable(ctx_obj.repository)
     if watch:
-        raise NotImplementedError("currently not implemented")
-        live = Live(
-            table.table,
-            auto_refresh=True,
-            refresh_per_second=1,
-            console=CONSOLE,
-        )
+        table = SummaryTable(ctx_obj.repository)
+        table.load(timespan, group)
+
+        live = Live(table.table, auto_refresh=False, console=CONSOLE)
         live.start()
-        event_handler = PatternMatchingEventHandler(patterns=["*.txt"])
+        live.refresh()
 
-        def on_modified(e):
-            table.load(timespan, group, reload=True)
-            return True
+        class Handler(PatternMatchingEventHandler):
+            def on_modified(self, event: FileSystemEvent) -> None:
+                ctx_obj.repository.load()
+                table = SummaryTable(ctx_obj.repository)
+                table.load(timespan, group)
+                live.update(table.table)
+                live.refresh()
+                return super().on_any_event(event)
 
-        event_handler.on_any_event = on_modified
-        observer = Observer()
-        observer.schedule(
-            event_handler,
+        event_handler = Handler(patterns=["*.txt"])
+        ob = Observer()
+        ob.schedule(
+            event_handler=event_handler,
             path=str(ctx_obj.get_timefile().parent),
         )
-        observer.start()
+        ob.start()
+
         try:
-            table.load(timespan, group)
-            live.refresh()
             while True:
                 sleep(1)
-                print("sleep")
         finally:
+            ob.join()
+            ob.stop()
             live.stop()
-            observer.stop()
-            observer.join()
     else:
+        table = SummaryTable(ctx_obj.repository)
         table.load(timespan, group)
         CONSOLE.print(table.table)
 
@@ -750,12 +750,6 @@ def edit_cmd(
 #         for option in options:
 #             value = dd
 #             print(f"{option} = {value}")
-
-
-@app.command("test")
-def test_cmd(ctx: typer.Context):
-    ctx_obj: TTrackContextObj = ctx.obj
-    print(ctx_obj.config.options("hooks"))
 
 
 @app.command("info")
