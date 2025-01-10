@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - run: apt update -y && apt install -y python3 python3-pipa
+      - run: apt update -y && apt install -y python3 python3-pip
       - run: pip install uv
       - run: uv sync
       - run: uv run pytest
