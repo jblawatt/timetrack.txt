@@ -8,6 +8,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - run: apt update -y && apt install -y python3 python3-pip
-      - run: pip install uv
+      - run: |
+          wget -qO- https://astral.sh/uv/install.sh | sh
+          mv /root/.local/bin/{uv,uvx} /usr/local/bin/
       - run: uv sync
       - run: uv run pytest
