@@ -24,32 +24,31 @@ TODO:
 - build with go!?
 """
 
-from watchdog.events import PatternMatchingEventHandler, FileSystemEvent
-
-from watchdog.observers import Observer
-
-from rich.live import Live
-from time import mktime, sleep
-
 import itertools
 import logging
 import os
 import re
 import subprocess
 import typing as t
+from collections import defaultdict
 from configparser import ConfigParser
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
-from pathlib import Path
 from functools import partial
+from itertools import count
+from pathlib import Path
+from time import mktime, sleep
 
 import pytimeparse
 import typer
 from pydantic import BaseModel, Field
 from rich import box
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
 from typing_extensions import Annotated
+from watchdog.events import FileSystemEvent, PatternMatchingEventHandler
+from watchdog.observers import Observer
 
 LOG = logging.getLogger(__name__)
 CONSOLE = Console()
@@ -57,8 +56,10 @@ CONSOLE = Console()
 DATE_FORMAT = "%Y-%m-%d"
 TIME_FORMAT = "%H:%M"
 
-RE_PROJECT = re.compile(r"^\+\w+| \+\w+")
-RE_CONTEXT = re.compile(r"^\@\w+| \@\w+")
+DATE_FORMAT_DISPLAY = "%a, %d.%m."
+
+RE_PROJECT = re.compile(r"(?:^|\s)\+(?P<name>\w+)")
+RE_CONTEXT = re.compile(r"(?:^|\s)\@(?P<name>\w+)")
 
 
 class TTrackFileMeta(BaseModel):
@@ -167,19 +168,23 @@ class TTrackItem(BaseModel):
         return RE_CONTEXT.search(self.text) is not None
 
     @property
+    def text_clean(self) -> str:
+        tc = self.text
+        tc = RE_PROJECT.sub("", tc)
+        tc = RE_CONTEXT.sub("", tc)
+        tc = tc.strip()
+        return tc.replace("  ", " ")
+
+    @property
     def project(self) -> str | None:
-        if not self.has_project():
-            return None
         if match := RE_PROJECT.search(self.text):
-            return match.group().strip()
+            return match.group("name").strip()
         return None
 
     @property
     def context(self) -> str | None:
-        if not self.has_context():
-            return None
         if match := RE_CONTEXT.search(self.text):
-            return match.group().strip()
+            return match.group("name").strip()
         return None
 
 
@@ -477,6 +482,10 @@ class TTrackContextObj:
             return logging.BASIC_FORMAT
         return logformat
 
+    def get_time_per_day(self) -> timedelta:
+        time_per_day = self.config.get("timetrack", "time_per_day", fallback="5h")
+        return timedelta(seconds=pytimeparse.parse(time_per_day))
+
     def apply_hook(self, prefix: str, context: dict) -> dict:
         hooks_to_call = sorted(
             [hook for hook in self.config.options("hooks") if hook.startswith(prefix)]
@@ -623,11 +632,11 @@ class SummaryTable:
                         str(index),
                         line.done or "-",
                         line.billable or "_",
+                        line.date.strftime(DATE_FORMAT_DISPLAY),
                         "",
-                        line.date.strftime(DATE_FORMAT),
                         "",
                         line.time.format(),
-                        line.text,
+                        line.text_clean,
                         line.project,
                         line.context,
                     )
@@ -644,7 +653,7 @@ class SummaryTable:
                         str(index),
                         "",
                         "",
-                        line.date.strftime(DATE_FORMAT),
+                        line.date.strftime(DATE_FORMAT_DISPLAY),
                         "{} {}".format(
                             line.time.SYMBOL,
                             datetime.strftime(
@@ -659,6 +668,31 @@ class SummaryTable:
                         # TODO: from config
                         style="green" if line.time.SYMBOL == ">" else "red",
                     )
+
+            if current_wd_item is not None:
+                worktime += current_wd_item.diff(
+                    TTrackWorkday(
+                        meta=TTrackWorkdayMeta(file=Path("."), line=-1),
+                        date=date.today(),
+                        time=TTrackEndTime(time=datetime.now().time()),
+                    )
+                )
+
+                self.table.add_row(
+                    "",
+                    "",
+                    "",
+                    "",
+                    "~ {}".format(
+                        datetime.strftime(datetime.now(), TIME_FORMAT),
+                    ),
+                    "",
+                    "",
+                    "",
+                    "",
+                    style="yellow",
+                    end_section=False,
+                )
 
             self.table.add_row(
                 "",
@@ -757,6 +791,55 @@ def info_cmd(ctx: typer.Context):
     ctx_obj: TTrackContextObj = ctx.obj
     typer.echo(f"timefile: {ctx_obj.get_timefile()}")
     typer.echo(f"hookdir: {ctx_obj.get_hookdir()}")
+
+
+@app.command("squash")
+def squash_cmd(
+    ctx: typer.Context,
+    timespan: Annotated[str, typer.Argument()] = TIMESPAN_TODAY,
+    group: Annotated[str, typer.Option("-g", "--group")] = "day",
+):
+    ctx_obj: TTrackContextObj = ctx.obj
+    filter_options = timespan_to_filter_options(timespan)
+    all_items = ctx_obj.repository.list(filter_options)
+    grouped_items = itertools.groupby(all_items, GROUP_FUNCTIONS[group])
+    time_per_day = ctx_obj.get_time_per_day()
+
+    data = defaultdict(lambda: defaultdict(lambda: timedelta(seconds=0)))
+    for group, items in grouped_items:
+        for item in items:
+            if not isinstance(item, TTrackItem):
+                continue
+            data[item.date][item.project] += item.time.time
+
+    table = Table(box=box.MINIMAL, padding=(0, 1))
+    table.add_column("#", justify="right")
+    table.add_column("date")
+    table.add_column("project")
+    table.add_column("time")
+
+    row_id = count()
+    for group, data in data.items():
+        current = timedelta(seconds=0)
+        for project, time_ in data.items():
+            table.add_row(
+                str(next(row_id)),
+                group.strftime(DATE_FORMAT_DISPLAY),
+                project,
+                format_timedelta(time_),
+            )
+            current += time_
+        row_color = "green" if time_ >= time_per_day else "yellow"
+        table.add_row(
+            "",
+            "",
+            "",
+            format_timedelta(current),
+            style=f"{row_color} bold",
+            end_section=True,
+        )
+
+    CONSOLE.print(table)
 
 
 if __name__ == "__main__":
