@@ -24,33 +24,42 @@ TODO:
 - build with go!?
 """
 
-import typing as t
+import itertools
 import logging
 import os
 import re
 import subprocess
 import typing as t
+from collections import defaultdict
 from configparser import ConfigParser
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, time
+from datetime import date, datetime, time, timedelta
+from functools import partial
+from itertools import count
 from pathlib import Path
+from time import mktime, sleep
 
 import pytimeparse
 import typer
 from pydantic import BaseModel, Field
 from rich import box
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
 from typing_extensions import Annotated
+from watchdog.events import FileSystemEvent, PatternMatchingEventHandler
+from watchdog.observers import Observer
 
-log = logging.getLogger(__name__)
-console = Console()
+LOG = logging.getLogger(__name__)
+CONSOLE = Console()
 
 DATE_FORMAT = "%Y-%m-%d"
 TIME_FORMAT = "%H:%M"
 
-RE_PROJECT = re.compile(r"^\+\w+| \+\w+")
-RE_CONTEXT = re.compile(r"^\@\w+| \@\w+")
+DATE_FORMAT_DISPLAY = "%a, %d.%m."
+
+RE_PROJECT = re.compile(r"(?:^|\s)\+(?P<name>\w+)")
+RE_CONTEXT = re.compile(r"(?:^|\s)\@(?P<name>\w+)")
 
 
 class TTrackFileMeta(BaseModel):
@@ -115,7 +124,12 @@ class TTrackEndTime(TTrackTime):
 class TTrackWorkday(BaseModel):
     meta: TTrackWorkdayMeta
     date: date
-    times: list[TTrackStartTime | TTrackEndTime] = Field(default_factory=list)
+    time: TTrackStartTime | TTrackEndTime
+
+    def diff(self, other: "TTrackWorkday") -> timedelta:
+        return datetime.combine(other.date, other.time.time) - datetime.combine(
+            self.date, self.time.time
+        )
 
 
 class TTrackItem(BaseModel):
@@ -154,19 +168,23 @@ class TTrackItem(BaseModel):
         return RE_CONTEXT.search(self.text) is not None
 
     @property
+    def text_clean(self) -> str:
+        tc = self.text
+        tc = RE_PROJECT.sub("", tc)
+        tc = RE_CONTEXT.sub("", tc)
+        tc = tc.strip()
+        return tc.replace("  ", " ")
+
+    @property
     def project(self) -> str | None:
-        if not self.has_project():
-            return None
         if match := RE_PROJECT.search(self.text):
-            return match.group().strip()
+            return match.group("name").strip()
         return None
 
     @property
     def context(self) -> str | None:
-        if not self.has_context():
-            return None
         if match := RE_CONTEXT.search(self.text):
-            return match.group().strip()
+            return match.group("name").strip()
         return None
 
 
@@ -250,12 +268,24 @@ def parser_time(line: str) -> t.Tuple[TTKey, TTrackTimeItemRaw, str]:
         )
 
 
+def parser_date_or_context(
+    line: str, fallback: date
+) -> t.Tuple[TTKey, date | None, str]:
+    line = line.lstrip()
+    if line.startswith("*"):
+        return "date", fallback, line[1:].lstrip()
+    return parser_date(line)
+
+
 def parse_line(line: str, context: dict[TTKey, OptionalTTValue] | None = None) -> dict:
     context = context or {}
+
+    dparse = partial(parser_date_or_context, fallback=context["prev_date"])
+
     parsers: list[ParserFunc | None] = [
         parser_done,
         parser_billable,
-        None if "date" in context else parser_date,
+        None if "date" in context else dparse,
         parser_time,
     ]
     result: dict[TTKey, OptionalTTValue] = {**context}
@@ -277,8 +307,8 @@ def parse_workday_time(line: str) -> TTrackStartTime | TTrackEndTime:
     return klass(time=datetime.strptime(line, TIME_FORMAT).time())
 
 
-def parse_file(file: Path) -> TTrackData:
-    result = TTrackData()
+def parse_file(file: Path) -> list[TTrackItem | TTrackWorkday]:
+    result: list[TTrackItem | TTrackWorkday] = []
     with file.open("r") as fhandle:
         line_no = 0
         context: dict[TTKey, OptionalTTValue] = {}
@@ -292,21 +322,23 @@ def parse_file(file: Path) -> TTrackData:
                     continue
             if not line.startswith("  ") and "date" in context:
                 del context["date"]
-            elif line.startswith("  >") or line.startswith("  <"):
+            if line.startswith("  >") or line.startswith("  <"):
                 try:
                     date_ = context["date"]
                 except KeyError as error:
                     raise RuntimeError(
                         "you cannot add workday outside of date context."
                     ) from error
-                workday = result.get_or_create_workday(
-                    t.cast(date, date_),
+                item = TTrackWorkday(
+                    date=t.cast(date, date_),
+                    time=parse_workday_time(line),
                     meta=TTrackWorkdayMeta(
                         file=file,
                         line=line_no,
                     ),
                 )
-                workday.times.append(parse_workday_time(line))
+                context["prev_date"] = item.date
+                result.append(item)
                 continue
             else:
                 line = line.strip()
@@ -319,7 +351,8 @@ def parse_file(file: Path) -> TTrackData:
                     **parse_line(line, context),
                 },
             )
-            result.items.append(item)
+            context["prev_date"] = item.date
+            result.append(item)
     return result
 
 
@@ -365,8 +398,8 @@ class TTrackRepository:
 
     def list(
         self, filter_options: TTrackFilterOptions | None = None
-    ) -> t.Iterable[TTrackItem]:
-        for item in self._data.items:
+    ) -> t.Iterable[TTrackItem | TTrackWorkday]:
+        for item in self._data:
             if filter_options is None:
                 yield item
                 continue
@@ -374,15 +407,16 @@ class TTrackRepository:
                 start, end = daterange
                 if not (start <= item.date <= end):
                     continue
-            if project := filter_options.project:
-                if item.project != project:
-                    continue
-            if context := filter_options.context:
-                if item.context != context:
-                    continue
-            if text := filter_options.text:
-                if text not in item.text.lower():
-                    continue
+            if isinstance(item, TTrackItem):
+                if project := filter_options.project:
+                    if item.project != project:
+                        continue
+                if context := filter_options.context:
+                    if item.context != context:
+                        continue
+                if text := filter_options.text:
+                    if text not in item.text.lower():
+                        continue
             yield item
 
 
@@ -448,6 +482,10 @@ class TTrackContextObj:
             return logging.BASIC_FORMAT
         return logformat
 
+    def get_time_per_day(self) -> timedelta:
+        time_per_day = self.config.get("timetrack", "time_per_day", fallback="5h")
+        return timedelta(seconds=pytimeparse.parse(time_per_day))
+
     def apply_hook(self, prefix: str, context: dict) -> dict:
         hooks_to_call = sorted(
             [hook for hook in self.config.options("hooks") if hook.startswith(prefix)]
@@ -460,12 +498,13 @@ class TTrackContextObj:
 TIMESPAN_TODAY: t.Final[str] = "today"
 TIMESPAN_MONTH: t.Final[str] = "month"
 TIMESPAN_WEEK: t.Final[str] = "week"
+TIMESPAN_YESTERDAY: t.Final[str] = "yesterday"
 
 
 def timespan_to_filter_options(timespan: str) -> TTrackFilterOptions:
     filter_options = TTrackFilterOptions()
     match timespan:
-        case "all":
+        case "all" | "al" | "a":
             pass
         case "today" | "t" | "to":
             tstart = tend = date.today()
@@ -490,7 +529,7 @@ def timespan_to_filter_options(timespan: str) -> TTrackFilterOptions:
 def root_callback(
     ctx: typer.Context,
     config_file: Annotated[
-        str, typer.Option("-c", "--config", envvar="TT_CONFIG_FILE")
+        str | None, typer.Option("-c", "--config", envvar="TT_CONFIG_FILE")
     ] = None,
 ):
     ctx.obj = TTrackContextObj(config_file)
@@ -530,58 +569,193 @@ def cmd_add(
     ctx_obj.apply_hook("post-add", {})
 
 
+class TTrackBaseItem(t.Protocol):
+    @property
+    def date(self) -> date: ...
+
+
+def to_unix_timestamp(value: date | datetime) -> int:
+    return int(mktime(value.timetuple()))
+
+
+def group_by_day(item: TTrackBaseItem) -> int:
+    return to_unix_timestamp(item.date)
+
+
+def group_by_week(time: TTrackBaseItem) -> str:
+    return time.date.strftime("%Y%U")
+
+
+GROUP_FUNCTIONS = {
+    "day": group_by_day,
+    "week": group_by_week,
+}
+
+
+class SummaryTable:
+    def __init__(self, repository: TTrackRepository):
+        self.repository = repository
+
+        table = Table(box=box.MINIMAL, padding=(0, 1))
+        table.add_column("#", justify="right")
+        table.add_column("x")
+        table.add_column("$")
+        table.add_column("date")
+        table.add_column("s/e")
+        table.add_column("wtime")
+        table.add_column("time", justify="right")
+        table.add_column("text")
+        table.add_column("project", justify="right")
+        table.add_column("context", justify="right")
+        self.table = table
+
+    def load(self, timespan: str, group: str, reload: bool = False):
+        self.table.rows.clear()
+
+        filter_options = timespan_to_filter_options(timespan)
+
+        if reload:
+            self.repository.load()
+        all_items = self.repository.list(filter_options)
+
+        grouped_items = itertools.groupby(all_items, GROUP_FUNCTIONS[group])
+
+        for _, items in grouped_items:
+            billable = timedelta(seconds=0)
+            overall = timedelta(seconds=0)
+
+            worktime = timedelta(seconds=0)
+            current_wd_item: TTrackWorkday | None = None
+            for index, line in enumerate(items):
+                if isinstance(line, TTrackItem):
+                    self.table.add_row(
+                        str(index),
+                        line.done or "-",
+                        line.billable or "_",
+                        line.date.strftime(DATE_FORMAT_DISPLAY),
+                        "",
+                        "",
+                        line.time.format(),
+                        line.text_clean,
+                        line.project,
+                        line.context,
+                    )
+                    if line.is_billable():
+                        billable += line.time.time
+                    overall += line.time.time
+                if isinstance(line, TTrackWorkday):
+                    if current_wd_item is not None:
+                        worktime += current_wd_item.diff(line)
+                        current_wd_item = None
+                    else:
+                        current_wd_item = line
+                    self.table.add_row(
+                        str(index),
+                        "",
+                        "",
+                        line.date.strftime(DATE_FORMAT_DISPLAY),
+                        "{} {}".format(
+                            line.time.SYMBOL,
+                            datetime.strftime(
+                                datetime.combine(line.date, line.time.time), TIME_FORMAT
+                            ),
+                        ),
+                        format_timedelta(worktime) if line.time.SYMBOL == "<" else "",
+                        format_timedelta(overall) if line.time.SYMBOL == "<" else "",
+                        "",
+                        "",
+                        "",
+                        # TODO: from config
+                        style="green" if line.time.SYMBOL == ">" else "red",
+                    )
+
+            if current_wd_item is not None:
+                worktime += current_wd_item.diff(
+                    TTrackWorkday(
+                        meta=TTrackWorkdayMeta(file=Path("."), line=-1),
+                        date=date.today(),
+                        time=TTrackEndTime(time=datetime.now().time()),
+                    )
+                )
+
+                self.table.add_row(
+                    "",
+                    "",
+                    "",
+                    "",
+                    "~ {}".format(
+                        datetime.strftime(datetime.now(), TIME_FORMAT),
+                    ),
+                    "",
+                    "",
+                    "",
+                    "",
+                    style="yellow",
+                    end_section=False,
+                )
+
+            self.table.add_row(
+                "",
+                "",
+                format_timedelta(billable),
+                "",
+                "",
+                format_timedelta(worktime),
+                format_timedelta(overall),
+                "",
+                "",
+                "",
+                style="blue bold",
+                end_section=True,
+            )
+
+
 @app.command("ls")
+@app.command("list")
 @app.command("summary")
 def cmd_summary(
     ctx: typer.Context,
     timespan: Annotated[str, typer.Argument()] = TIMESPAN_TODAY,
+    group: Annotated[str, typer.Option("-g", "--group")] = "day",
+    watch: Annotated[bool, typer.Option("-w", is_flag=True)] = False,
 ):
     ctx_obj: TTrackContextObj = ctx.obj
+    if watch:
+        table = SummaryTable(ctx_obj.repository)
+        table.load(timespan, group)
 
-    filter_options = timespan_to_filter_options(timespan)
+        live = Live(table.table, auto_refresh=False, console=CONSOLE)
+        live.start()
+        live.refresh()
 
-    billable = timedelta(seconds=0)
-    overall = timedelta(seconds=0)
+        class Handler(PatternMatchingEventHandler):
+            def on_modified(self, event: FileSystemEvent) -> None:
+                ctx_obj.repository.load()
+                table = SummaryTable(ctx_obj.repository)
+                table.load(timespan, group)
+                live.update(table.table)
+                live.refresh()
+                return super().on_any_event(event)
 
-    table = Table(box=box.MINIMAL, padding=(0, 1))
-    table.add_column("#", justify="right")
-    table.add_column("x")
-    table.add_column("$")
-    table.add_column("date")
-    table.add_column("time", justify="right")
-    table.add_column("text")
-    table.add_column("project", justify="right")
-    table.add_column("context", justify="right")
-
-    for index, line in enumerate(ctx_obj.repository.list(filter_options)):
-        # console.print(line.to_line(), style=ctx_obj.get_rich_line_style())
-        table.add_row(
-            str(index),
-            line.done or "-",
-            line.billable or "_",
-            line.date.strftime(DATE_FORMAT),
-            line.time.format(),
-            line.text,
-            line.project,
-            line.context,
+        event_handler = Handler(patterns=["*.txt"])
+        ob = Observer()
+        ob.schedule(
+            event_handler=event_handler,
+            path=str(ctx_obj.get_timefile().parent),
         )
-        if line.is_billable():
-            billable += line.time.time
-        overall += line.time.time
+        ob.start()
 
-    table.add_row(
-        "",
-        "",
-        format_timedelta(billable),
-        "",
-        format_timedelta(overall),
-        "",
-        "",
-        "",
-        end_section=True,
-    )
-
-    console.print(table)
+        try:
+            while True:
+                sleep(1)
+        finally:
+            ob.join()
+            ob.stop()
+            live.stop()
+    else:
+        table = SummaryTable(ctx_obj.repository)
+        table.load(timespan, group)
+        CONSOLE.print(table.table)
 
 
 @app.command("edit")
@@ -612,17 +786,60 @@ def edit_cmd(
 #             print(f"{option} = {value}")
 
 
-@app.command("test")
-def test_cmd(ctx: typer.Context):
-    ctx_obj: TTrackContextObj = ctx.obj
-    print(ctx_obj.config.options("hooks"))
-
-
 @app.command("info")
 def info_cmd(ctx: typer.Context):
     ctx_obj: TTrackContextObj = ctx.obj
     typer.echo(f"timefile: {ctx_obj.get_timefile()}")
     typer.echo(f"hookdir: {ctx_obj.get_hookdir()}")
+
+
+@app.command("squash")
+def squash_cmd(
+    ctx: typer.Context,
+    timespan: Annotated[str, typer.Argument()] = TIMESPAN_TODAY,
+    group: Annotated[str, typer.Option("-g", "--group")] = "day",
+):
+    ctx_obj: TTrackContextObj = ctx.obj
+    filter_options = timespan_to_filter_options(timespan)
+    all_items = ctx_obj.repository.list(filter_options)
+    grouped_items = itertools.groupby(all_items, GROUP_FUNCTIONS[group])
+    time_per_day = ctx_obj.get_time_per_day()
+
+    data = defaultdict(lambda: defaultdict(lambda: timedelta(seconds=0)))
+    for group, items in grouped_items:
+        for item in items:
+            if not isinstance(item, TTrackItem):
+                continue
+            data[item.date][item.project] += item.time.time
+
+    table = Table(box=box.MINIMAL, padding=(0, 1))
+    table.add_column("#", justify="right")
+    table.add_column("date")
+    table.add_column("project")
+    table.add_column("time")
+
+    row_id = count()
+    for group, data in data.items():
+        current = timedelta(seconds=0)
+        for project, time_ in data.items():
+            table.add_row(
+                str(next(row_id)),
+                group.strftime(DATE_FORMAT_DISPLAY),
+                project,
+                format_timedelta(time_),
+            )
+            current += time_
+        row_color = "green" if time_ >= time_per_day else "yellow"
+        table.add_row(
+            "",
+            "",
+            "",
+            format_timedelta(current),
+            style=f"{row_color} bold",
+            end_section=True,
+        )
+
+    CONSOLE.print(table)
 
 
 if __name__ == "__main__":

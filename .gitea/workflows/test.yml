@@ -1,0 +1,15 @@
+name: Gitea Actions Demo
+run-name: ${{ gitea.actor }} is testing out Gitea Actions 🚀
+on: [push]
+
+jobs:
+  Build-Image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: apt update -y && apt install -y python3 python3-pip
+      - run: |
+          wget -qO- https://astral.sh/uv/install.sh | sh
+          mv /root/.local/bin/{uv,uvx} /usr/local/bin/
+      - run: uv sync
+      - run: uv run pytest
